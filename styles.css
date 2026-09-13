@@ -1,0 +1,326 @@
+:root{
+  --color-bg:#f5f7fb;
+  --color-surface:#ffffff;
+  --color-ink:#0b1220;
+  --color-ink-muted:#64748b;
+  --color-border:#e2e8f0;
+  --color-border-input:#cbd5e1;
+  --color-accent:#0b1220;
+  --color-accent-ink:#ffffff;
+  --color-subtle:#e8edf3;
+  --color-danger-bg:#fee2e2;
+  --color-danger-ink:#991b1b;
+  --color-success:#16a34a;
+  --color-success-bg:#dcfce7;
+  --color-success-ink:#166534;
+  --color-warning-bg:#fef3c7;
+  --color-warning-ink:#92400e;
+  --color-hero-sub:#cbd5e1;
+  --color-hero-kicker:#94a3b8;
+
+  --space-1:4px;
+  --space-2:8px;
+  --space-3:12px;
+  --space-4:16px;
+  --space-5:20px;
+  --space-6:24px;
+
+  --radius-sm:10px;
+  --radius-md:13px;
+  --radius-lg:18px;
+  --radius-xl:22px;
+  --radius-pill:99px;
+
+  --font-sans:Inter,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+  --text-xs:11px;
+  --text-sm:12px;
+  --text-base:14px;
+  --text-md:16px;
+  --text-lg:20px;
+  --text-xl:26px;
+  --text-2xl:28px;
+  --text-display:32px;
+
+  --weight-bold:700;
+  --weight-heavy:800;
+  --weight-black:900;
+
+  --shadow-card:0 3px 12px rgba(11,18,32,0.05);
+  --shadow-card-hover:0 6px 20px rgba(11,18,32,0.09);
+  --focus-ring:0 0 0 3px rgba(11,18,32,0.28);
+
+  /* Phase 8: comfortable reading/content widths, so nothing stretches into
+     unreadably long lines or a sea of empty space on wide desktop screens. */
+  --max-width-app:1050px;
+  --max-width-reading:720px;
+  --max-width-prose:62ch;
+}
+
+*{box-sizing:border-box}
+body{margin:0;background:var(--color-bg);color:var(--color-ink);font-family:var(--font-sans)}
+.app{max-width:var(--max-width-app);margin:auto;padding:var(--space-6) var(--space-4) 70px}
+
+.topbar{display:flex;justify-content:space-between;align-items:center;margin-bottom:var(--space-5)}
+.topbar h1{font-size:var(--text-display);margin:4px 0;font-weight:var(--weight-black);letter-spacing:-0.01em}
+.kicker{font-size:var(--text-xs);letter-spacing:.16em;font-weight:var(--weight-black);color:var(--color-ink-muted)}
+#date{font-size:var(--text-sm);color:var(--color-ink-muted)}
+.add{border:0;background:var(--color-accent);color:var(--color-accent-ink);border-radius:var(--radius-md);width:44px;height:44px;font-size:22px;cursor:pointer;transition:transform .12s ease}
+.add:hover{transform:scale(1.04)}
+.add:active{transform:scale(.96)}
+
+/* Settings topbar icon button (mobile transformation pass) — same 44px touch
+   target as .add, but visually secondary (subtle fill, not accent) since it's
+   a secondary destination, not the primary action in the header. */
+.icon-btn{border:0;background:var(--color-subtle);color:var(--color-ink);border-radius:var(--radius-md);width:44px;height:44px;display:inline-flex;align-items:center;justify-content:center;cursor:pointer;transition:transform .12s ease,background .12s ease;flex-shrink:0}
+.icon-btn svg{width:20px;height:20px;display:block}
+.icon-btn:hover{background:var(--color-border)}
+.icon-btn:active{transform:scale(.96)}
+
+.hero{background:var(--color-accent);color:var(--color-accent-ink);border-radius:var(--radius-xl);padding:var(--space-6);margin-bottom:var(--space-3)}
+.hero .kicker{color:var(--color-hero-kicker)}
+.hero h2{margin:var(--space-2) 0;font-size:var(--text-xl);font-weight:var(--weight-heavy);letter-spacing:-0.01em}
+.hero p{color:var(--color-hero-sub);margin:0;max-width:var(--max-width-prose)}
+
+/* Phase 8: the lightweight, consistent one-line intro every Progress/Life
+   sub-page uses instead of a repeated full dark .hero block — the page's own
+   title already comes from the persistent topbar h1, so this only needs to add
+   ONE line of real context (a live insight where one exists, otherwise a short,
+   honest statement of what the section actually does). Keeps sub-pages feeling
+   like one coherent family instead of a stack of unrelated admin screens, and
+   keeps .hero reserved for the two true landing surfaces (Home, Explore) so it
+   still reads as special there instead of being diluted by repetition. */
+.page-intro{color:var(--color-ink-muted);font-size:var(--text-base);line-height:1.5;max-width:var(--max-width-prose);margin:0 0 var(--space-5)}
+
+.grid{display:grid;gap:var(--space-3)}
+.four{grid-template-columns:repeat(4,1fr)}
+.three{grid-template-columns:repeat(3,1fr)}
+.two{grid-template-columns:repeat(2,1fr)}
+
+.card{background:var(--color-surface);border:1px solid var(--color-border);border-radius:var(--radius-lg);padding:var(--space-4);box-shadow:var(--shadow-card)}
+.metric{font-size:var(--text-2xl);font-weight:var(--weight-black);line-height:1.2}
+.metric .unit{font-size:var(--text-sm);font-weight:var(--weight-bold);color:var(--color-ink-muted);margin-left:3px}
+.muted,.small{color:var(--color-ink-muted)}
+.small{font-size:var(--text-sm)}
+.section{margin:var(--space-6) 0 var(--space-2);font-size:var(--text-md);font-weight:var(--weight-bold)}
+/* A rarer, heavier break for switching between two genuinely different zones of
+   one long page (e.g. Explore's "discover something new" vs. "your own saved/
+   logged activity") — used sparingly, never per-section, so it still reads as
+   a real shift rather than just another header. */
+.section-major{margin:var(--space-6) 0 var(--space-1);padding-top:var(--space-5);border-top:1px solid var(--color-border);font-size:var(--text-lg);font-weight:var(--weight-black)}
+/* Progressive disclosure (Settings reorganization): occasional-use groups
+   (Location, AI) are wrapped in a native <details> whose <summary> reuses
+   .section-major so a collapsed group still reads exactly like every other
+   section heading — only the cursor and marker hint that it's interactive. */
+summary.section-major{cursor:pointer;list-style:none;display:flex;align-items:center;gap:6px}
+summary.section-major::-webkit-details-marker{display:none}
+summary.section-major::before{content:'▸';display:inline-block;font-size:var(--text-sm);color:var(--color-ink-muted);transition:transform .12s ease}
+details[open]>summary.section-major::before{transform:rotate(90deg)}
+.settings-group{margin:0}
+
+/* Phase 8: primary nav sits on its own light "shelf" and the Progress/Life
+   secondary chip row sits on a matching, slightly deeper shelf directly under
+   it with no gap between them — reads as one connected navigation unit (parent
+   + its sub-section) rather than two unrelated rows of buttons floating near
+   each other, without the secondary row visually competing with page content. */
+.nav-shelf{background:var(--color-subtle);border-radius:var(--radius-lg);padding:6px;margin:var(--space-4) 0 var(--space-3)}
+.tabs{display:flex;gap:3px;overflow:auto}
+.tab{border:0;background:transparent;padding:9px 13px;border-radius:var(--radius-sm);white-space:nowrap;font-weight:var(--weight-bold);cursor:pointer;color:var(--color-ink-muted);transition:background .12s ease,color .12s ease;display:inline-flex;align-items:center;gap:6px}
+.tab.active{background:var(--color-accent);color:var(--color-accent-ink)}
+.tab:not(.active):hover{color:var(--color-ink)}
+.tab-icon{display:inline-flex;flex-shrink:0}
+.tab-icon svg{width:18px;height:18px;display:block}
+
+/* ---- Progress/Life section switcher (Phase 16/8) ---- */
+.subtabs{display:flex;gap:5px;overflow:auto;background:var(--color-bg);border-radius:calc(var(--radius-lg) - 4px);padding:5px;margin-top:4px}
+.subtab{border:0;background:transparent;padding:7px 12px;border-radius:var(--radius-pill);white-space:nowrap;font-weight:var(--weight-bold);font-size:var(--text-sm);cursor:pointer;color:var(--color-ink-muted);transition:background .12s ease,color .12s ease}
+.subtab.active{background:var(--color-surface);color:var(--color-ink);box-shadow:var(--shadow-card)}
+.subtab:not(.active):hover{color:var(--color-ink)}
+
+.task{display:flex;gap:var(--space-3);padding:var(--space-3) 0;border-bottom:1px solid var(--color-border)}
+.task:last-child{border-bottom:0}
+.task input{width:20px;height:20px}
+.done{opacity:.48;text-decoration:line-through}
+
+.barbg{height:9px;background:var(--color-subtle);border-radius:var(--radius-pill);overflow:hidden}
+.bar{height:100%;background:var(--color-accent);border-radius:var(--radius-pill);transition:width .3s ease}
+
+.btn,input,select,textarea{font:inherit}
+/* Phase 8 button hierarchy: .btn (primary/solid) for the one important action in
+   a group, .secondary (light fill) for supporting actions, .tertiary (no fill,
+   no border — text-weight only) for low-emphasis actions that shouldn't compete
+   visually, .danger (existing, untouched) for destructive actions. Not every
+   button needs to look equally important — most groups in this app already lead
+   with .btn + trail with .secondary; .tertiary is additive for the quieter
+   "Cancel"/"skip"-type actions that don't have a home yet. */
+/* .btn is sometimes rendered as an <a> (the recommendation card's Maps/Website
+   actions) rather than a <button> — inline-block + no-underline keeps those
+   looking identical to every other button in the app instead of showing a
+   stray browser-default link underline. */
+.btn{display:inline-block;border:0;border-radius:var(--radius-sm);padding:10px 13px;background:var(--color-accent);color:var(--color-accent-ink);font-weight:var(--weight-bold);cursor:pointer;text-decoration:none;transition:opacity .12s ease,transform .05s ease}
+.btn:hover{opacity:.92}
+.btn:active{transform:scale(.98)}
+.btn[disabled]{opacity:.45;cursor:not-allowed;pointer-events:none}
+.secondary{background:var(--color-subtle);color:var(--color-ink)}
+.tertiary{background:transparent;color:var(--color-ink-muted);padding-left:6px;padding-right:6px}
+.tertiary:hover{color:var(--color-ink);opacity:1;background:var(--color-subtle)}
+.danger{background:var(--color-danger-bg);color:var(--color-danger-ink)}
+
+/* Accessibility (Step 18): a visible, consistent focus ring for every
+   interactive element reachable by keyboard — never relies on default browser
+   outlines alone (inconsistent across elements/browsers) but only shows for
+   keyboard focus, never on a mouse click, so it doesn't add visual noise to
+   normal tapping/clicking. */
+.btn:focus-visible,.tab:focus-visible,.subtab:focus-visible,.input:focus-visible,
+select:focus-visible,textarea:focus-visible,a:focus-visible{
+  outline:none;box-shadow:var(--focus-ring)
+}
+
+.input,select,textarea{border:1px solid var(--color-border-input);border-radius:var(--radius-sm);padding:10px;width:100%;background:var(--color-surface);transition:border-color .12s ease}
+.input:focus,select:focus,textarea:focus{border-color:var(--color-ink-muted);outline:none}
+.row{display:flex;gap:var(--space-2);flex-wrap:wrap}
+.list{margin-top:var(--space-2)}
+.item{padding:var(--space-3) 0;border-bottom:1px solid var(--color-border)}
+.item:last-child{border:0}
+
+.pill{display:inline-block;padding:5px 8px;border-radius:var(--radius-pill);background:var(--color-subtle);font-size:var(--text-xs);font-weight:var(--weight-heavy)}
+.pill-active{background:var(--color-success-bg);color:var(--color-success-ink)}
+.pill-warning{background:var(--color-warning-bg);color:var(--color-warning-ink)}
+.pill-danger{background:var(--color-danger-bg);color:var(--color-danger-ink)}
+
+.status-active{border-color:var(--color-success);box-shadow:0 0 0 1px var(--color-success)}
+
+.sparkline{width:100%;height:120px;display:block}
+.sparkline.small{height:64px}
+.trend-caption{display:flex;justify-content:space-between;margin-top:6px}
+
+.set-row{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin:8px 0}
+.set-row .input{min-height:44px}
+.qty-btn{min-width:40px;min-height:40px;padding:0}
+
+.score{font-size:36px;font-weight:var(--weight-black)}
+.empty{text-align:center;padding:var(--space-5);color:var(--color-ink-muted)}
+.quote{border-left:3px solid var(--color-hero-kicker);padding-left:var(--space-3)}
+
+#toast{position:fixed;left:50%;bottom:24px;transform:translate(-50%,10px);max-width:calc(100% - 32px);background:var(--color-accent);color:var(--color-accent-ink);padding:11px 18px;border-radius:var(--radius-md);font-size:var(--text-sm);font-weight:var(--weight-bold);box-shadow:var(--shadow-card);text-align:center;opacity:0;pointer-events:none;transition:opacity .2s ease,transform .2s ease;z-index:1000}
+#toast.show{opacity:1;transform:translate(-50%,0)}
+
+/* ---- Mentor (Phase 2) ---- */
+.mentor-shell{max-width:var(--max-width-reading);margin:0 auto}
+
+.mentor-landing{padding:var(--space-6) var(--space-1) var(--space-5)}
+.mentor-landing h2{font-size:var(--text-2xl);font-weight:var(--weight-black);margin:0 0 8px}
+.mentor-landing p{margin:0;max-width:var(--max-width-prose)}
+
+.mentor-conversation{margin-bottom:var(--space-2)}
+.mentor-show-earlier{width:100%;margin-bottom:var(--space-3)}
+
+/* Phase 8: standard modern-assistant chat pattern — the user's own messages sit
+   in a light right-aligned bubble (position + tint alone signal "this is you,"
+   so the role label is redundant there and is hidden), while Mentor's replies
+   stay plain, full-width, left-aligned text — the more prose a reply has, the
+   worse a bubble reads, and prioritizing the CONVERSATION over chrome is the
+   explicit Phase 8 goal. Generous vertical rhythm between turns replaces the
+   old per-message divider line for a calmer, less "form list" feel. */
+.mentor-msg{padding:8px 0}
+.mentor-msg-role{font-size:var(--text-xs);font-weight:var(--weight-heavy);color:var(--color-ink-muted);text-transform:uppercase;letter-spacing:.04em;margin-bottom:4px}
+.mentor-msg-user{display:flex;flex-direction:column;align-items:flex-end}
+.mentor-msg-user .mentor-msg-role{display:none}
+.mentor-msg-user .mentor-msg-body{background:var(--color-subtle);border-radius:var(--radius-lg) var(--radius-lg) 4px var(--radius-lg);padding:10px 14px;max-width:88%}
+.mentor-msg-body{line-height:1.55;font-size:var(--text-base);overflow-wrap:anywhere}
+.mentor-msg-body p{margin:0 0 10px}
+.mentor-msg-body p:last-child{margin-bottom:0}
+.mentor-msg-body ul,.mentor-msg-body ol{margin:0 0 10px;padding-left:22px}
+.mentor-msg-body li{margin-bottom:4px}
+.mentor-msg-error{border-left:3px solid var(--color-danger-ink);padding-left:10px}
+.mentor-msg-error .mentor-msg-body{color:var(--color-danger-ink)}
+
+.mentor-typing{display:inline-flex;gap:4px;padding:10px 0}
+.mentor-typing span{width:6px;height:6px;border-radius:50%;background:var(--color-ink-muted);animation:mentor-typing-bounce 1s infinite ease-in-out}
+.mentor-typing span:nth-child(2){animation-delay:.15s}
+.mentor-typing span:nth-child(3){animation-delay:.3s}
+@keyframes mentor-typing-bounce{0%,80%,100%{opacity:.3;transform:translateY(0)}40%{opacity:1;transform:translateY(-3px)}}
+
+/* Step 7: NAME leads, bigger/bolder than anything else in the card. ADDRESS is
+   full-ink (not muted) since it's one of the three load-bearing fields, right
+   under the name where a map pin's info window puts it. WHY gets its own
+   tinted block so the reasoning is scannable at a glance, not buried in a run
+   of small-muted metadata lines. Supporting metadata (hours/price/distance/
+   date) stays small+muted, clearly secondary, exactly as the hierarchy asks. */
+.mentor-rec-card{margin-top:10px;padding:var(--space-4);border:1px solid var(--color-border);border-radius:var(--radius-lg);background:var(--color-surface);box-shadow:var(--shadow-card);overflow-wrap:anywhere}
+.mentor-rec-name{font-weight:var(--weight-black);font-size:var(--text-lg);line-height:1.25}
+.mentor-rec-address{margin-top:4px;font-size:var(--text-base);color:var(--color-ink)}
+.mentor-rec-why{margin-top:10px;padding:10px 12px;background:var(--color-subtle);border-radius:var(--radius-sm);font-size:var(--text-base);line-height:1.45}
+.mentor-rec-meta{margin-top:8px}
+
+.mentor-history-panel{margin-top:var(--space-2);margin-bottom:var(--space-3)}
+
+.mentor-composer{position:sticky;bottom:0;background:var(--color-bg);padding-top:var(--space-3);padding-bottom:var(--space-3);border-top:1px solid var(--color-border);z-index:5}
+.mentor-input{resize:none;max-height:150px;overflow-y:auto;line-height:1.4;flex:1 1 auto}
+.mentor-send-btn{flex:0 0 auto}
+.mentor-suggestions{margin-top:8px}
+
+/* ---- Explore (Phase 4) ---- */
+.explore-hero{padding:var(--space-5) var(--space-1) var(--space-4)}
+.explore-hero h2{font-size:var(--text-2xl);font-weight:var(--weight-black);margin:4px 0}
+.explore-hero .kicker{color:var(--color-ink-muted)}
+.explore-find-card #explore_find_input{flex:1 1 auto}
+.explore-chip-row{margin-top:10px;flex-wrap:wrap}
+.explore-chip{white-space:nowrap}
+.explore-foryou-note{padding:var(--space-2) 0;border-bottom:1px solid var(--color-border);font-size:var(--text-sm)}
+.explore-foryou-note:last-child{border-bottom:0}
+.explore-soon-grid{display:grid;grid-template-columns:1fr 1fr;gap:var(--space-3);margin-top:10px}
+.explore-history-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:var(--space-3)}
+.explore-history-card{background:var(--color-subtle);border-radius:var(--radius-md);padding:var(--space-3)}
+
+@media(max-width:700px){
+  .four,.three{grid-template-columns:repeat(2,1fr)}
+  .two{grid-template-columns:1fr}
+  .explore-soon-grid,.explore-history-grid{grid-template-columns:1fr}
+  .topbar h1{font-size:var(--text-xl)}
+  /* C1: 16px is the threshold under which iOS Safari auto-zooms the viewport on
+     input focus — scoped to mobile widths only so desktop typography is untouched. */
+  .input,select,textarea{font-size:16px}
+  /* C2: bring tap targets closer to the ~44px comfortable-touch minimum, scoped to
+     mobile only so the desktop visual density is unchanged. Vertical padding only —
+     horizontal padding/width is untouched so wrapping/layout doesn't shift. */
+  .subtab{padding-top:10px;padding-bottom:10px}
+  .btn{padding-top:14px;padding-bottom:14px}
+  .qty-btn{min-width:44px;min-height:44px}
+
+  /* Mobile transformation pass: the primary 5-tab row becomes a real fixed
+     bottom navigation bar (icon over label) instead of the old Phase 16
+     "cram 6 text tabs into one scrollable row" approach — now moot since
+     Settings moved to a topbar icon and only 5 items remain. .nav-shelf still
+     wraps tabs+subtabs in markup (navShelf() in shell.js), but on mobile only
+     .subtabs (the contextual Progress/Life switcher) stays in normal document
+     flow; .tabs escapes into position:fixed regardless of that ancestor since
+     nothing between them sets transform/filter/perspective. */
+  .nav-shelf{background:transparent;padding:0;margin:0 0 var(--space-3)}
+  .tabs{
+    position:fixed;left:0;right:0;bottom:0;z-index:30;
+    display:flex;gap:0;overflow:visible;
+    background:var(--color-surface);
+    border-top:1px solid var(--color-border);
+    box-shadow:0 -2px 16px rgba(11,18,32,0.08);
+    padding:6px var(--space-2) calc(6px + env(safe-area-inset-bottom));
+  }
+  .tab{
+    flex:1 1 0;min-width:0;
+    flex-direction:column;justify-content:center;gap:3px;
+    padding:6px 2px;border-radius:var(--radius-sm);
+    font-size:10px;font-weight:var(--weight-bold);
+  }
+  .tab.active{background:transparent;color:var(--color-accent)}
+  .tab-icon svg{width:22px;height:22px}
+  .tab-label{overflow:hidden;text-overflow:ellipsis;max-width:100%}
+  /* Room for the fixed bottom nav so the last card on any page is never
+     hidden behind it; also respects the iOS home-indicator safe area. */
+  .app{padding-bottom:calc(82px + env(safe-area-inset-bottom))}
+  /* Mentor's sticky composer would otherwise stick to bottom:0 of the
+     viewport, right underneath (z-index-wise, behind) the fixed bottom nav
+     bar added above — lift it to sit just above the nav bar instead. */
+  .mentor-composer{bottom:calc(74px + env(safe-area-inset-bottom))}
+}
+@media(max-width:420px){
+  .four{grid-template-columns:1fr}
+}

@@ -1,0 +1,8 @@
+{
+  "scripts": {
+    "test": "node tests/run-all.mjs"
+  },
+  "devDependencies": {
+    "supabase": "^2.117.0"
+  }
+}
