@@ -345,29 +345,62 @@ export function recordProviderCooldown(cooldowns, provider, retryAfterSeconds, n
   return { ...(cooldowns||{}), [provider]: now + ms };
 }
 
+// ---- Priority tiers + Gemini concurrency limiter ----
+// BOTH Mentor and Explore may use the full Groq -> Gemini fallback — an earlier
+// version of this router excluded Explore from Gemini entirely, which was the
+// wrong fix. The actual free-tier protection is CONCURRENCY, not exclusion:
+// Gemini's shared quota is a small pool of concurrent-request "slots", and each
+// priority tier may only occupy so many of them at once. A request that can't
+// get a slot is treated exactly like a cooling-down provider for that one
+// request — Gemini is simply left out of its order, never blocked/queued
+// (bounded, no invented retry-until-a-slot-frees-up loop).
+//
+// Three tiers, in priority order:
+//   'mentor'             — an active Mentor chat message. May use the WHOLE pool.
+//   'explore'            — a user-initiated Explore action (typed a search, tapped
+//                           a quick prompt, tapped "Find/Refresh things happening
+//                           soon"). Gets most of the pool, never all of it, so a
+//                           burst of Explore taps can't fully starve Mentor.
+//   'explore-background' — reserved for any non-interactive/automatic Explore
+//                           work (none exists in this app today — both of
+//                           Explore's current call sites are real taps, see
+//                           views/explore.js). Gets the smallest slice, so if
+//                           this is ever used later it can never meaningfully
+//                           compete with either Mentor or a real user action.
+export const GEMINI_MAX_CONCURRENT = 4;
+export const GEMINI_TIER_CONCURRENCY_CAP = {
+  mentor: 4,
+  explore: 2,
+  'explore-background': 1,
+};
+export function normalizeSourceTier(source){
+  if (source==='explore-background') return 'explore-background';
+  if (source==='explore') return 'explore';
+  return 'mentor'; // default — covers real Mentor messages AND any older/unrecognized client payload
+}
+// activeBySource: a plain {mentor,explore,'explore-background'} count of Gemini
+// requests currently in flight, owned and mutated by index.ts (Deno-only state);
+// this function only ever reads it. Pure/testable with a plain object.
+export function canAdmitToGemini({ source, activeTotal, activeBySource }){
+  if ((activeTotal||0) >= GEMINI_MAX_CONCURRENT) return false;
+  const tier = normalizeSourceTier(source);
+  const tierActive = (activeBySource && activeBySource[tier]) || 0;
+  return tierActive < GEMINI_TIER_CONCURRENCY_CAP[tier];
+}
+
 // Builds the ordered list of providers to actually try for this one request.
 // Groq (the free default/primary) always goes first when configured and not
 // currently cooling down from a recent 429 — a provider already known to be
 // rate-limited is skipped entirely rather than wasted on a request we already
-// expect to fail.
-//
-// "Mentor priority": Explore's live-discovery research (exploreResearch() in
-// views/explore.js) reuses this exact same backend/pipe as Mentor's own chat —
-// see explore.js's own comment "same recursive tool loop... same webSearch/
-// presentRecommendation/Tavily path" — but it is a supplementary feature, not
-// the app's primary conversational surface. So when Groq is cooling down, an
-// Explore-sourced request does NOT fall through to Gemini; only a genuine
-// Mentor chat message (source !== 'explore') gets the automatic fallback. This
-// reserves Gemini's free-tier quota for the conversation the user is actually
-// having, rather than letting background Explore research silently burn
-// through the one thing standing between Mentor and "AI unavailable" for
-// everyone. Explore still gets normal access to Groq itself either way — this
-// only ever affects the FALLBACK provider.
-export function buildProviderOrder({ hasGroq, hasGemini, source, cooldowns, now }){
-  const isMentor = source !== 'explore';
+// expect to fail. Gemini is included for EVERY source tier (Mentor and both
+// Explore tiers) as long as it's configured, not cooling down, AND the calling
+// tier can currently get a concurrency slot — see canAdmitToGemini above.
+export function buildProviderOrder({ hasGroq, hasGemini, source, cooldowns, now, geminiConcurrency }){
   const order = [];
   if (hasGroq && !isProviderCoolingDown(cooldowns, 'groq', now)) order.push('groq');
-  if (hasGemini && isMentor && !isProviderCoolingDown(cooldowns, 'gemini', now)) order.push('gemini');
+  if (hasGemini && !isProviderCoolingDown(cooldowns, 'gemini', now) && canAdmitToGemini({ source, ...(geminiConcurrency||{}) })) {
+    order.push('gemini');
+  }
   return order;
 }
 

@@ -71,7 +71,83 @@ function task(id,title,sub){return `<div class="task ${S.checks[id]?'done':''}">
 function go(v){location.hash=v;render(v)}
 function check(id){S.checks[id]=!S.checks[id];save();render('today')}
 let lastRenderedTab=null;
-function render(v=location.hash.slice(1)||'today'){let titles={today:'Home',body:'Body',training:'Training',nutrition:'Nutrition',bjj:'BJJ',money:'Money',growth:'Career',social:'Social',explore:'Explore',review:'Weekly Review',coach:'AI Coach',mentor:'Mentor',settings:'Settings'};lastRenderedTab=v;if(PROGRESS_ROUTES.includes(v))lastProgressTab=v;else if(LIFE_ROUTES.includes(v))lastLifeTab=v;$('title').textContent=titles[v]||'Home';$('date').textContent=new Date().toLocaleDateString(undefined,{weekday:'long',month:'long',day:'numeric',year:'numeric'});$('app').innerHTML=navShelf(v)+(views[v]?views[v]():views.today());}
+// ---- Authentication render gate (critical privacy fix) ----
+// `S` is loaded from this device's localStorage unconditionally at startup
+// (state.js) and is completely independent of Supabase auth — it is NOT
+// cleared or hidden by a sign-out, by design (see cloudSignOut()'s own
+// comment: "Signing out never deletes anything on the device"). Every view
+// function (views.today, views.mentor, views.settings, etc.) renders directly
+// from S with no auth check of its own. Before this gate, render() called
+// those view functions unconditionally, so ANY device that had ever held real
+// personal data in S — this device after a sign-out, a fresh device that used
+// pure offline Local Mode, a shared device — would show that data to whoever
+// next opened the app, with no credential required at all. That is the exact
+// bug: authentication was wired to gate the CLOUD data (sync/Mentor), never
+// to gate what actually gets RENDERED.
+//
+// This is now the ONLY place any view function is ever invoked (verified: no
+// other code calls views[x]() directly), so gating here is a complete fix, not
+// a partial one. It is a real code branch that skips calling the view
+// function entirely — not a CSS visibility trick — so the personal data is
+// never even serialized into the DOM while signed out.
+function renderAuthLoadingShell(){
+  return `<div class="card" style="margin-top:40px;text-align:center"><p class="muted">Restoring session…</p></div>`;
+}
+// Reuses renderAccountCard() (sync.js) — the exact same, already-correct
+// Email/Password/Sign In/Create account form Settings uses — rather than a
+// second, divergent sign-in form. This is deliberately the ONLY thing shown
+// while signed out; no personalized nav, no personalized data, nothing to
+// navigate into.
+//
+// AUTH_STATE.ERROR gets its own, different copy here on purpose: it only ever
+// happens when the startup session restore itself failed (e.g. offline right
+// at launch) — see initCloud()'s own comment, "very likely transient... never
+// treat this as sign the user out." Their session is NOT destroyed and
+// CLOUD.user isn't cleared; this screen shows while it's simply unverified,
+// and recoverSessionIfNeeded() automatically flips back to signed-in (and
+// re-renders) the moment connectivity returns. It must still show zero
+// personal data during that window — but telling a legitimately signed-in
+// person "please create an account" would be actively misleading, so this
+// case gets an honest "reconnecting" message instead of the sign-in form.
+function renderSignedOutShell(){
+  const authState=(typeof getAuthState==='function')?getAuthState():null;
+  if(authState===AUTH_STATE.ERROR){
+    const err=(typeof getAuthError==='function')?getAuthError():null;
+    return `<div class="card" style="margin-top:40px;text-align:center;padding:32px 20px">
+<div class="kicker" style="margin-bottom:8px">PERSONAL LIFE OS</div>
+<h2 style="margin:0 0 8px;font-size:var(--text-2xl);font-weight:var(--weight-black)">Reconnecting…</h2>
+<p class="muted" style="max-width:420px;margin:0 auto">${esc(err||"Couldn't verify your session right now — it hasn't been cleared, this will resolve automatically once you're back online.")}</p>
+</div>`;
+  }
+  return `<div class="card" style="margin-top:24px;text-align:center;padding:32px 20px">
+<div class="kicker" style="margin-bottom:8px">PERSONAL LIFE OS</div>
+<h2 style="margin:0 0 8px;font-size:var(--text-2xl);font-weight:var(--weight-black)">Welcome to Life OS</h2>
+<p class="muted" style="max-width:420px;margin:0 auto">Sign in to see your own Home, Mentor, Explore, Progress, and Life. This device shows nothing personal until you do.</p>
+</div>
+${renderAccountCard()}`;
+}
+function render(v=location.hash.slice(1)||'today'){
+  let titles={today:'Home',body:'Body',training:'Training',nutrition:'Nutrition',bjj:'BJJ',money:'Money',growth:'Career',social:'Social',explore:'Explore',review:'Weekly Review',coach:'AI Coach',mentor:'Mentor',settings:'Settings'};
+  const authState=(typeof getAuthState==='function')?getAuthState():AUTH_STATE.SIGNED_OUT;
+  if(authState===AUTH_STATE.LOADING){
+    lastRenderedTab=null;
+    $('title').textContent='Life OS';$('date').textContent='';
+    $('app').innerHTML=renderAuthLoadingShell();
+    return;
+  }
+  if(authState!==AUTH_STATE.SIGNED_IN){
+    // Covers SIGNED_OUT, SIGNING_IN, ERROR, and REFRESHING-without-a-user —
+    // every non-fully-authenticated state defaults to showing nothing
+    // personal, never a partial/best-effort render. Deliberately ignores `v`
+    // entirely: direct navigation to #mentor/#progress/#life/any old deep
+    // link while signed out must land here too, not on the requested view.
+    lastRenderedTab=null;
+    $('title').textContent='Life OS';$('date').textContent='';
+    $('app').innerHTML=renderSignedOutShell();
+    return;
+  }
+  lastRenderedTab=v;if(PROGRESS_ROUTES.includes(v))lastProgressTab=v;else if(LIFE_ROUTES.includes(v))lastLifeTab=v;$('title').textContent=titles[v]||'Home';$('date').textContent=new Date().toLocaleDateString(undefined,{weekday:'long',month:'long',day:'numeric',year:'numeric'});$('app').innerHTML=navShelf(v)+(views[v]?views[v]():views.today());
+}
 // Accepts both the old ("adventure") and new ("explore") typed keyword so old
 // muscle memory still works — both route to the same tab.
 function quickAdd(){let x=prompt('Type: social, explore, career, review, bjj');if(x==='social')go('social');else if(x==='adventure'||x==='explore')go('explore');else if(x==='career')go('growth');else if(x==='review')go('review');else if(x==='bjj')go('bjj')}

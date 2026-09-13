@@ -1,5 +1,5 @@
 // Bump CACHE_VERSION on every deploy so installed clients pick up new files.
-const CACHE_VERSION = 'v42';
+const CACHE_VERSION = 'v44';
 const CACHE = `life-os-${CACHE_VERSION}`;
 const ASSETS = [
   './',

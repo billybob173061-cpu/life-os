@@ -324,8 +324,25 @@ async function exploreFindSomething(promptText){
 // modern-consumer-app behavior here.
 function exploreRunQuickPrompt(text){ exploreFindSomething(text); }
 
+// Freshness guard: "Refresh" fires two real AI requests (tonight + weekend) —
+// a genuine user tap, not a background poll, but nothing stops someone from
+// tapping it several times in quick succession (impatience, a slow network
+// making the button look unresponsive, etc.). Below this interval, a repeat
+// tap is treated as "already fresh" rather than firing another pair of
+// requests — this is the "must not make unnecessary AI requests" guard;
+// opening/re-opening Explore itself already never refetches on its own
+// (exploreHappeningSoon is a plain module variable that simply persists
+// across re-renders and re-navigations within the session).
+const EXPLORE_HAPPENING_SOON_MIN_REFRESH_MS=30000;
 async function exploreFindHappeningSoon(){
   if(exploreBusy) return;
+  if(exploreHappeningSoon&&!exploreHappeningSoon.tonight?.loading){
+    const ageMs=Date.now()-new Date(exploreHappeningSoon.fetchedAt).getTime();
+    if(ageMs<EXPLORE_HAPPENING_SOON_MIN_REFRESH_MS){
+      toast(`Already fresh — updated ${relativeTimeLabel(exploreHappeningSoon.fetchedAt)}`);
+      return;
+    }
+  }
   exploreBusy=true;
   exploreHappeningSoon={fetchedAt:new Date().toISOString(),tonight:{loading:true},weekend:{loading:true}};
   render('explore');

@@ -54,6 +54,7 @@ import {
   parseGeminiResponse,
   buildProviderOrder,
   recordProviderCooldown,
+  normalizeSourceTier,
   makeCacheKey,
   getCachedResponse,
   setCachedResponse,
@@ -83,7 +84,16 @@ const ACTIVE_API_KEY = LLM_PROVIDER === 'anthropic' ? LLM_API_KEY : GROQ_API_KEY
 // Only ever active alongside the default/"groq" LLM_PROVIDER mode — the
 // separate, opt-in, paid Anthropic path (LLM_PROVIDER=anthropic) is untouched.
 const GEMINI_API_KEY = Deno.env.get('GEMINI_API_KEY');
-const GEMINI_MODEL = Deno.env.get('GEMINI_MODEL') || 'gemini-2.0-flash';
+// gemini-2.0-flash (the original default here) was retired by Google on
+// 2026-06-01 — confirmed directly against Google's own current model/pricing
+// docs (ai.google.dev/gemini-api/docs/models, /docs/pricing), not guessed.
+// Every fallback call using that dead model ID has been failing since then,
+// which is very likely why the Groq->Gemini fallback appeared completely
+// non-functional in production despite the router itself being correct.
+// gemini-3.5-flash-lite is confirmed (same docs) to be: GA/stable (not
+// preview), free-tier, and function-calling capable — the same three
+// properties the original choice was picked for.
+const GEMINI_MODEL = Deno.env.get('GEMINI_MODEL') || 'gemini-3.5-flash-lite';
 
 // ---- Provider cooldowns + response cache/dedup — module-level, in-memory only.
 // Supabase Edge Functions may reuse a warm isolate across requests for a while,
@@ -94,6 +104,14 @@ const GEMINI_MODEL = Deno.env.get('GEMINI_MODEL') || 'gemini-2.0-flash';
 let providerCooldowns: Record<string, number> = {};
 const responseCache = new Map();
 const inFlightRequests = new Map();
+// Gemini concurrency tracking — how many Gemini requests are ACTUALLY in flight
+// right now, broken down by priority tier (mentor / explore / explore-background).
+// This is what lets Explore genuinely use the Gemini fallback (not excluded
+// entirely, as an earlier version of this router did) while still protecting
+// the shared free-tier quota: see canAdmitToGemini/GEMINI_TIER_CONCURRENCY_CAP
+// in shared.mjs for the actual admission policy this state feeds into.
+let geminiActiveTotal = 0;
+const geminiActiveBySource: Record<string, number> = { mentor: 0, explore: 0, 'explore-background': 0 };
 
 // Phase 3 — real-world research. Tavily was chosen specifically for this: a
 // single simple REST endpoint, a free tier, and results already shaped for LLM
@@ -414,6 +432,23 @@ async function callProvider(provider, body) {
   }
 }
 
+// One Gemini call, wrapped with concurrency-slot bookkeeping. Both the total
+// and per-tier counters are incremented right before the actual fetch and
+// ALWAYS decremented afterward (success or failure) so a slot is never
+// permanently leaked. This is the enforcement side of canAdmitToGemini's
+// admission decision in buildProviderOrder — that function only ever READS
+// these counts (it's pure/Deno-free), this is the one place they change.
+async function callGeminiTracked(body, tier) {
+  geminiActiveTotal += 1;
+  geminiActiveBySource[tier] = (geminiActiveBySource[tier] || 0) + 1;
+  try {
+    return await callProvider('gemini', body);
+  } finally {
+    geminiActiveTotal -= 1;
+    geminiActiveBySource[tier] = Math.max(0, (geminiActiveBySource[tier] || 0) - 1);
+  }
+}
+
 // Router: tries each provider in buildProviderOrder()'s order, in sequence,
 // stopping at the first success. Bounded by construction — at most as many
 // attempts as there are configured providers (today: at most 2, Groq then
@@ -422,6 +457,11 @@ async function callProvider(provider, body) {
 // this preserves it exactly, just extended across providers instead of within
 // one. A provider that just 429'd gets a cooldown recorded so the NEXT request
 // (not just this one) skips straight past it instead of wasting a call.
+//
+// Both Mentor AND Explore (both tiers) go through this exact same router —
+// see buildProviderOrder/canAdmitToGemini in shared.mjs for how priority is
+// actually enforced (a small per-tier concurrency allowance on Gemini, not an
+// outright exclusion).
 async function callLlmWithFallback(body, source) {
   if (LLM_PROVIDER === 'anthropic') {
     // Unchanged single-provider path — the free-tier Groq/Gemini router below
@@ -437,23 +477,25 @@ async function callLlmWithFallback(body, source) {
     return r; // already-shaped httpError/status from a non-ok, non-429, non-5xx response
   }
 
+  const tier = normalizeSourceTier(source);
   const order = buildProviderOrder({
     hasGroq: !!GROQ_API_KEY,
     hasGemini: !!GEMINI_API_KEY,
     source,
     cooldowns: providerCooldowns,
     now: Date.now(),
+    geminiConcurrency: { activeTotal: geminiActiveTotal, activeBySource: geminiActiveBySource },
   });
   if (!order.length) {
-    // Every configured provider is currently cooling down (or, for an
-    // Explore-sourced request, the only available one is) — fail fast with the
+    // Every configured provider is currently cooling down, or (for Gemini)
+    // this tier has no free concurrency slot right now — fail fast with the
     // same rate-limit shape a live 429 would produce, no point spending a call.
     return { httpError: { error: 'The AI provider is rate-limiting requests right now.', retryAfterSeconds: null }, status: 429 };
   }
 
   let lastFailure;
   for (const provider of order) {
-    const r = await callProvider(provider, body);
+    const r = provider === 'gemini' ? await callGeminiTracked(body, tier) : await callProvider(provider, body);
     if (r.parsed) return { parsed: r.parsed };
     if (r.rateLimited) {
       providerCooldowns = recordProviderCooldown(providerCooldowns, provider, r.retryAfterSeconds, Date.now());
@@ -574,12 +616,13 @@ Deno.serve(async (req) => {
   const limitCheck = checkRequestLimits(body);
   if (!limitCheck.ok) return jsonResponse({ error: limitCheck.error }, 400, cors);
 
-  // 'explore' only when the client explicitly says so (Explore's own
-  // exploreResearch() in views/explore.js) — every other caller (real Mentor
-  // chat, and any older deployed frontend that predates this field) is treated
-  // as 'mentor', which is the more permissive/full-access path. See
-  // buildProviderOrder in shared.mjs for exactly what this changes.
-  const source = body.source === 'explore' ? 'explore' : 'mentor';
+  // Recognizes 'mentor' / 'explore' / 'explore-background' (see
+  // normalizeSourceTier in shared.mjs) — anything else, including an older
+  // deployed frontend that predates this field entirely, defaults to 'mentor',
+  // the highest-priority/most-permissive tier. Both Mentor and Explore get the
+  // full Groq->Gemini router; only each tier's slice of Gemini's concurrency
+  // pool differs — see GEMINI_TIER_CONCURRENCY_CAP in shared.mjs.
+  const source = normalizeSourceTier(body.source);
 
   // ---- Response cache + in-flight dedup ----
   // Keyed by (user, source, exact message, exact toolExchanges-so-far) — see

@@ -17,6 +17,10 @@ import {
   isProviderCoolingDown,
   recordProviderCooldown,
   DEFAULT_PROVIDER_COOLDOWN_MS,
+  normalizeSourceTier,
+  canAdmitToGemini,
+  GEMINI_MAX_CONCURRENT,
+  GEMINI_TIER_CONCURRENCY_CAP,
   buildGeminiContents,
   toGeminiToolDefinitions,
   parseGeminiResponse,
@@ -161,46 +165,128 @@ test('checkRequestLimits rejects a non-object body', () => assert.equal(checkReq
 test('checkRequestLimits rejects an oversized message', () => assert.equal(checkRequestLimits({ message: 'a'.repeat(100000) }).ok, false));
 test('checkRequestLimits accepts a normal request', () => assert.equal(checkRequestLimits({ message: 'hello' }).ok, true));
 
-describe('shared.mjs — provider router (Groq primary + Gemini free-tier fallback)');
+describe('shared.mjs — provider router (Groq primary + Gemini free-tier fallback, BOTH Mentor and Explore)');
+
+const noConcurrency = { activeTotal: 0, activeBySource: {} };
+
+// ---- Requirement 1-4: Groq success/429 for both Mentor and Explore ----
+test('[req 1] Mentor + Groq available: order tries groq (a real callProvider("groq",...) success means Gemini is never called)', () => {
+  const order = buildProviderOrder({ hasGroq: true, hasGemini: true, source: 'mentor', cooldowns: {}, now: 1000, geminiConcurrency: noConcurrency });
+  assert.equal(order[0], 'groq'); // the router loop (index.ts) stops at the first success, so groq succeeding means gemini is genuinely never attempted
+});
+test('[req 2] Mentor + Groq cooling down (i.e. Groq just returned 429): order falls back to gemini', () => {
+  const order = buildProviderOrder({ hasGroq: true, hasGemini: true, source: 'mentor', cooldowns: { groq: 5000 }, now: 1000, geminiConcurrency: noConcurrency });
+  assert.deepEqual(order, ['gemini']);
+});
+test('[req 3] Explore (user-initiated) + Groq available: order tries groq first, same as Mentor', () => {
+  const order = buildProviderOrder({ hasGroq: true, hasGemini: true, source: 'explore', cooldowns: {}, now: 1000, geminiConcurrency: noConcurrency });
+  assert.equal(order[0], 'groq');
+});
+test('[req 4] Explore (user-initiated) + Groq cooling down: order falls back to gemini — Explore DOES get the fallback (the earlier "Explore never gets Gemini" design was wrong and has been replaced)', () => {
+  const order = buildProviderOrder({ hasGroq: true, hasGemini: true, source: 'explore', cooldowns: { groq: 5000 }, now: 1000, geminiConcurrency: noConcurrency });
+  assert.deepEqual(order, ['gemini']);
+});
+test('[req 4b] explore-background + Groq cooling down also falls back to gemini when a slot is free', () => {
+  const order = buildProviderOrder({ hasGroq: true, hasGemini: true, source: 'explore-background', cooldowns: { groq: 5000 }, now: 1000, geminiConcurrency: noConcurrency });
+  assert.deepEqual(order, ['gemini']);
+});
+
+// ---- Requirement 5-6: graceful failure, no infinite retry ----
+test('[req 5] Groq cooling down + Gemini ALSO cooling down (i.e. Gemini already 429\'d) => empty order => graceful failure, not a retry loop', () => {
+  const order = buildProviderOrder({ hasGroq: true, hasGemini: true, source: 'explore', cooldowns: { groq: 5000, gemini: 5000 }, now: 1000, geminiConcurrency: noConcurrency });
+  assert.deepEqual(order, []);
+});
+test('[req 6] both providers cooling down => empty order regardless of source (Mentor, explore, or explore-background)', () => {
+  for (const source of ['mentor', 'explore', 'explore-background']) {
+    const order = buildProviderOrder({ hasGroq: true, hasGemini: true, source, cooldowns: { groq: 5000, gemini: 5000 }, now: 1000, geminiConcurrency: noConcurrency });
+    assert.deepEqual(order, [], `source=${source}`);
+  }
+});
+test('[req 14] the router is structurally bounded to at most 2 providers per request — never an unbounded/infinite retry', () => {
+  const order = buildProviderOrder({ hasGroq: true, hasGemini: true, source: 'mentor', cooldowns: {}, now: 1000, geminiConcurrency: noConcurrency });
+  assert.ok(order.length <= 2);
+});
 
 test('Groq-only: order is just groq when Gemini is not configured', () => {
   const order = buildProviderOrder({ hasGroq: true, hasGemini: false, source: 'mentor', cooldowns: {}, now: 1000 });
   assert.deepEqual(order, ['groq']);
 });
-test('both configured, Mentor source: order is groq then gemini', () => {
-  const order = buildProviderOrder({ hasGroq: true, hasGemini: true, source: 'mentor', cooldowns: {}, now: 1000 });
-  assert.deepEqual(order, ['groq', 'gemini']);
-});
 test('both configured, Mentor source implied by an absent/undefined source (backward compatible with an older client)', () => {
-  const order = buildProviderOrder({ hasGroq: true, hasGemini: true, source: undefined, cooldowns: {}, now: 1000 });
+  const order = buildProviderOrder({ hasGroq: true, hasGemini: true, source: undefined, cooldowns: {}, now: 1000, geminiConcurrency: noConcurrency });
   assert.deepEqual(order, ['groq', 'gemini']);
-});
-test('Mentor priority: Explore source never includes Gemini, even when configured and available', () => {
-  const order = buildProviderOrder({ hasGroq: true, hasGemini: true, source: 'explore', cooldowns: {}, now: 1000 });
-  assert.deepEqual(order, ['groq']);
-});
-test('Mentor priority: Groq cooling down + Explore source => empty order (no fallback to Gemini for Explore)', () => {
-  const order = buildProviderOrder({ hasGroq: true, hasGemini: true, source: 'explore', cooldowns: { groq: 5000 }, now: 1000 });
-  assert.deepEqual(order, []);
-});
-test('Groq cooling down + Mentor source => order is just gemini (automatic fallback)', () => {
-  const order = buildProviderOrder({ hasGroq: true, hasGemini: true, source: 'mentor', cooldowns: { groq: 5000 }, now: 1000 });
-  assert.deepEqual(order, ['gemini']);
 });
 test('a cooldown that has already expired (now past it) no longer excludes the provider', () => {
   const order = buildProviderOrder({ hasGroq: true, hasGemini: false, source: 'mentor', cooldowns: { groq: 500 }, now: 1000 });
   assert.deepEqual(order, ['groq']);
 });
-test('both providers cooling down => empty order regardless of source', () => {
-  const order = buildProviderOrder({ hasGroq: true, hasGemini: true, source: 'mentor', cooldowns: { groq: 5000, gemini: 5000 }, now: 1000 });
-  assert.deepEqual(order, []);
+
+describe('shared.mjs — Gemini concurrency limiter (provider-aware rate protection, not exclusion or unlimited access)');
+
+test('normalizeSourceTier maps recognized values and defaults everything else to mentor', () => {
+  assert.equal(normalizeSourceTier('mentor'), 'mentor');
+  assert.equal(normalizeSourceTier('explore'), 'explore');
+  assert.equal(normalizeSourceTier('explore-background'), 'explore-background');
+  assert.equal(normalizeSourceTier(undefined), 'mentor');
+  assert.equal(normalizeSourceTier('something-unexpected'), 'mentor');
 });
+
+test('canAdmitToGemini admits when no requests are in flight', () => {
+  assert.equal(canAdmitToGemini({ source: 'mentor', activeTotal: 0, activeBySource: {} }), true);
+  assert.equal(canAdmitToGemini({ source: 'explore', activeTotal: 0, activeBySource: {} }), true);
+  assert.equal(canAdmitToGemini({ source: 'explore-background', activeTotal: 0, activeBySource: {} }), true);
+});
+test('[req 7] Mentor priority: Mentor keeps getting admitted after explore-background has used its one slot (background never starves Mentor)', () => {
+  const activeBySource = { 'explore-background': GEMINI_TIER_CONCURRENCY_CAP['explore-background'] };
+  const activeTotal = activeBySource['explore-background'];
+  assert.equal(canAdmitToGemini({ source: 'mentor', activeTotal, activeBySource }), true);
+});
+test('[req 7b] Mentor priority: Mentor may use up to the FULL pool even while Explore already holds its own cap', () => {
+  const activeBySource = { explore: GEMINI_TIER_CONCURRENCY_CAP.explore };
+  const activeTotal = activeBySource.explore;
+  assert.equal(canAdmitToGemini({ source: 'mentor', activeTotal, activeBySource }), true);
+});
+test('[req 8] User Explore priority: a user-initiated Explore request is still admitted after explore-background has used its one slot', () => {
+  const activeBySource = { 'explore-background': GEMINI_TIER_CONCURRENCY_CAP['explore-background'] };
+  const activeTotal = activeBySource['explore-background'];
+  assert.equal(canAdmitToGemini({ source: 'explore', activeTotal, activeBySource }), true);
+});
+test('[req 8b] explore-background is denied once it has used its own (smallest) slice, even if the global pool has room', () => {
+  const activeBySource = { 'explore-background': GEMINI_TIER_CONCURRENCY_CAP['explore-background'] };
+  const activeTotal = activeBySource['explore-background'];
+  assert.equal(canAdmitToGemini({ source: 'explore-background', activeTotal, activeBySource }), false);
+});
+test('explore is denied once IT has used its own slice, even while mentor\'s slice is untouched', () => {
+  const activeBySource = { explore: GEMINI_TIER_CONCURRENCY_CAP.explore };
+  const activeTotal = activeBySource.explore;
+  assert.equal(canAdmitToGemini({ source: 'explore', activeTotal, activeBySource }), false);
+});
+test('nobody is admitted once the GLOBAL pool is full, even mentor', () => {
+  assert.equal(canAdmitToGemini({ source: 'mentor', activeTotal: GEMINI_MAX_CONCURRENT, activeBySource: { mentor: GEMINI_MAX_CONCURRENT } }), false);
+});
+test('buildProviderOrder actually excludes gemini for a tier with no free concurrency slot (not just cooldowns)', () => {
+  const activeBySource = { explore: GEMINI_TIER_CONCURRENCY_CAP.explore };
+  const order = buildProviderOrder({
+    hasGroq: true, hasGemini: true, source: 'explore', cooldowns: { groq: 5000 }, now: 1000,
+    geminiConcurrency: { activeTotal: activeBySource.explore, activeBySource },
+  });
+  assert.deepEqual(order, []); // groq cooling down AND explore's gemini slice already full => graceful failure, no crash, no wait
+});
+test('buildProviderOrder still lets mentor through gemini when explore\'s (but not mentor\'s) slice is full', () => {
+  const activeBySource = { explore: GEMINI_TIER_CONCURRENCY_CAP.explore };
+  const order = buildProviderOrder({
+    hasGroq: true, hasGemini: true, source: 'mentor', cooldowns: { groq: 5000 }, now: 1000,
+    geminiConcurrency: { activeTotal: activeBySource.explore, activeBySource },
+  });
+  assert.deepEqual(order, ['gemini']);
+});
+
+describe('shared.mjs — provider cooldowns');
 
 test('isProviderCoolingDown is true while now < cooldown-until', () => assert.equal(isProviderCoolingDown({ groq: 2000 }, 'groq', 1000), true));
 test('isProviderCoolingDown is false once now has passed the cooldown-until', () => assert.equal(isProviderCoolingDown({ groq: 500 }, 'groq', 1000), false));
 test('isProviderCoolingDown is false for a provider with no recorded cooldown at all', () => assert.equal(isProviderCoolingDown({}, 'groq', 1000), false));
 
-test('recordProviderCooldown uses the provider-supplied retryAfterSeconds when given', () => {
+test('[req 13] recordProviderCooldown uses the provider-supplied Retry-After (retryAfterSeconds) when valid', () => {
   const c = recordProviderCooldown({}, 'groq', 10, 1000);
   assert.equal(c.groq, 1000 + 10000);
 });
@@ -213,6 +299,17 @@ test('recordProviderCooldown never mutates the cooldowns object passed in', () =
   const c = recordProviderCooldown(original, 'groq', 5, 1000);
   assert.equal(original.groq, undefined);
   assert.equal(c.gemini, 42); // untouched providers are preserved in the new object
+});
+test('[req 13b] Gemini gets its OWN independent cooldown, recorded separately from Groq\'s', () => {
+  let cooldowns = recordProviderCooldown({}, 'groq', 10, 1000);
+  cooldowns = recordProviderCooldown(cooldowns, 'gemini', 20, 1000);
+  assert.equal(cooldowns.groq, 11000);
+  assert.equal(cooldowns.gemini, 21000);
+  // Groq's cooldown expiring independently returns it to the order, per the
+  // "return to Groq when its cooldown expires" requirement — this is exactly
+  // isProviderCoolingDown's job, exercised again here for the two-provider case.
+  assert.equal(isProviderCoolingDown(cooldowns, 'groq', 11001), false);
+  assert.equal(isProviderCoolingDown(cooldowns, 'gemini', 11001), true);
 });
 
 describe('shared.mjs — Gemini request/response shape');
@@ -292,6 +389,18 @@ test('makeCacheKey differs between Mentor and Explore for the identical message'
   const k1 = makeCacheKey('user1', 'mentor', { message: 'same text' });
   const k2 = makeCacheKey('user1', 'explore', { message: 'same text' });
   assert.notEqual(k1, k2);
+});
+test('[req 9] two duplicate Mentor requests (same user, same message, same turn state) produce the identical cache key, so index.ts\'s in-flight Map correctly treats them as one turn', () => {
+  const body = { message: 'what should I do tonight', toolExchanges: [] };
+  assert.equal(makeCacheKey('user1', 'mentor', body), makeCacheKey('user1', 'mentor', body));
+});
+test('[req 10] two duplicate Explore requests (same user, same prompt) also collide onto one cache key, same as Mentor', () => {
+  const body = { message: 'something fun tonight', toolExchanges: [] };
+  assert.equal(makeCacheKey('user1', 'explore', body), makeCacheKey('user1', 'explore', body));
+});
+test('[req 11] cache isolation: two DIFFERENT users asking the identical question never collide onto the same key', () => {
+  const body = { message: 'what should I do tonight', toolExchanges: [] };
+  assert.notEqual(makeCacheKey('user-a', 'mentor', body), makeCacheKey('user-b', 'mentor', body));
 });
 
 test('getCachedResponse returns null for a key that was never set', () => {
