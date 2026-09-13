@@ -13,6 +13,17 @@ import {
   checkRequestLimits,
   MAX_REC_FIELD_LENGTH,
   MAX_SEARCH_RESULTS,
+  buildProviderOrder,
+  isProviderCoolingDown,
+  recordProviderCooldown,
+  DEFAULT_PROVIDER_COOLDOWN_MS,
+  buildGeminiContents,
+  toGeminiToolDefinitions,
+  parseGeminiResponse,
+  fnv1aHash,
+  makeCacheKey,
+  getCachedResponse,
+  setCachedResponse,
 } from '../supabase/functions/mentor/shared.mjs';
 
 describe('shared.mjs — URL safety');
@@ -149,3 +160,162 @@ test('checkRequestLimits rejects a missing message', () => assert.equal(checkReq
 test('checkRequestLimits rejects a non-object body', () => assert.equal(checkRequestLimits(null).ok, false));
 test('checkRequestLimits rejects an oversized message', () => assert.equal(checkRequestLimits({ message: 'a'.repeat(100000) }).ok, false));
 test('checkRequestLimits accepts a normal request', () => assert.equal(checkRequestLimits({ message: 'hello' }).ok, true));
+
+describe('shared.mjs — provider router (Groq primary + Gemini free-tier fallback)');
+
+test('Groq-only: order is just groq when Gemini is not configured', () => {
+  const order = buildProviderOrder({ hasGroq: true, hasGemini: false, source: 'mentor', cooldowns: {}, now: 1000 });
+  assert.deepEqual(order, ['groq']);
+});
+test('both configured, Mentor source: order is groq then gemini', () => {
+  const order = buildProviderOrder({ hasGroq: true, hasGemini: true, source: 'mentor', cooldowns: {}, now: 1000 });
+  assert.deepEqual(order, ['groq', 'gemini']);
+});
+test('both configured, Mentor source implied by an absent/undefined source (backward compatible with an older client)', () => {
+  const order = buildProviderOrder({ hasGroq: true, hasGemini: true, source: undefined, cooldowns: {}, now: 1000 });
+  assert.deepEqual(order, ['groq', 'gemini']);
+});
+test('Mentor priority: Explore source never includes Gemini, even when configured and available', () => {
+  const order = buildProviderOrder({ hasGroq: true, hasGemini: true, source: 'explore', cooldowns: {}, now: 1000 });
+  assert.deepEqual(order, ['groq']);
+});
+test('Mentor priority: Groq cooling down + Explore source => empty order (no fallback to Gemini for Explore)', () => {
+  const order = buildProviderOrder({ hasGroq: true, hasGemini: true, source: 'explore', cooldowns: { groq: 5000 }, now: 1000 });
+  assert.deepEqual(order, []);
+});
+test('Groq cooling down + Mentor source => order is just gemini (automatic fallback)', () => {
+  const order = buildProviderOrder({ hasGroq: true, hasGemini: true, source: 'mentor', cooldowns: { groq: 5000 }, now: 1000 });
+  assert.deepEqual(order, ['gemini']);
+});
+test('a cooldown that has already expired (now past it) no longer excludes the provider', () => {
+  const order = buildProviderOrder({ hasGroq: true, hasGemini: false, source: 'mentor', cooldowns: { groq: 500 }, now: 1000 });
+  assert.deepEqual(order, ['groq']);
+});
+test('both providers cooling down => empty order regardless of source', () => {
+  const order = buildProviderOrder({ hasGroq: true, hasGemini: true, source: 'mentor', cooldowns: { groq: 5000, gemini: 5000 }, now: 1000 });
+  assert.deepEqual(order, []);
+});
+
+test('isProviderCoolingDown is true while now < cooldown-until', () => assert.equal(isProviderCoolingDown({ groq: 2000 }, 'groq', 1000), true));
+test('isProviderCoolingDown is false once now has passed the cooldown-until', () => assert.equal(isProviderCoolingDown({ groq: 500 }, 'groq', 1000), false));
+test('isProviderCoolingDown is false for a provider with no recorded cooldown at all', () => assert.equal(isProviderCoolingDown({}, 'groq', 1000), false));
+
+test('recordProviderCooldown uses the provider-supplied retryAfterSeconds when given', () => {
+  const c = recordProviderCooldown({}, 'groq', 10, 1000);
+  assert.equal(c.groq, 1000 + 10000);
+});
+test('recordProviderCooldown falls back to the default cooldown when no retryAfterSeconds is given', () => {
+  const c = recordProviderCooldown({}, 'groq', null, 1000);
+  assert.equal(c.groq, 1000 + DEFAULT_PROVIDER_COOLDOWN_MS);
+});
+test('recordProviderCooldown never mutates the cooldowns object passed in', () => {
+  const original = { gemini: 42 };
+  const c = recordProviderCooldown(original, 'groq', 5, 1000);
+  assert.equal(original.groq, undefined);
+  assert.equal(c.gemini, 42); // untouched providers are preserved in the new object
+});
+
+describe('shared.mjs — Gemini request/response shape');
+
+test('buildGeminiContents maps history roles to user/model (not assistant)', () => {
+  const contents = buildGeminiContents({ message: 'hi', history: [{ role: 'user', text: 'a' }, { role: 'assistant', text: 'b' }] });
+  assert.equal(contents[0].role, 'user');
+  assert.equal(contents[1].role, 'model');
+  assert.equal(contents[1].parts[0].text, 'b');
+});
+test('buildGeminiContents appends the current message as the final user turn', () => {
+  const contents = buildGeminiContents({ message: 'current question', history: [] });
+  assert.equal(contents[contents.length - 1].role, 'user');
+  assert.equal(contents[contents.length - 1].parts[0].text, 'current question');
+});
+test('buildGeminiContents turns a toolExchange into a model functionCall + function functionResponse pair', () => {
+  const contents = buildGeminiContents({ message: 'hi', history: [], toolExchanges: [{ tool: 'getTodayPlan', args: {}, callId: 'x', result: 'the plan' }] });
+  const callTurn = contents.find(c => c.parts[0] && c.parts[0].functionCall);
+  const resultTurn = contents.find(c => c.parts[0] && c.parts[0].functionResponse);
+  assert.equal(callTurn.role, 'model');
+  assert.equal(callTurn.parts[0].functionCall.name, 'getTodayPlan');
+  assert.equal(resultTurn.role, 'function');
+  assert.equal(resultTurn.parts[0].functionResponse.response.result, 'the plan');
+});
+
+test('toGeminiToolDefinitions wraps every tool in one functionDeclarations array', () => {
+  const defs = toGeminiToolDefinitions([{ name: 'a', description: 'd', schema: { type: 'object', properties: {}, required: [] } }]);
+  assert.equal(defs.length, 1);
+  assert.equal(defs[0].functionDeclarations[0].name, 'a');
+  assert.equal(defs[0].functionDeclarations[0].parameters.type, 'object');
+});
+
+test('parseGeminiResponse returns a final text answer when no functionCall part is present', () => {
+  const out = parseGeminiResponse({ candidates: [{ content: { parts: [{ text: 'hello there' }] } }] });
+  assert.equal(out.type, 'final');
+  assert.equal(out.text, 'hello there');
+});
+test('parseGeminiResponse returns a tool_call for a valid, approved tool with a synthesized string callId', () => {
+  const out = parseGeminiResponse({ candidates: [{ content: { parts: [{ functionCall: { name: 'getTodayPlan', args: {} } }] } } ] });
+  assert.equal(out.type, 'tool_call');
+  assert.equal(out.tool, 'getTodayPlan');
+  assert.equal(typeof out.callId, 'string');
+  assert.ok(out.callId.length > 0);
+});
+test('parseGeminiResponse rejects a functionCall naming an unapproved tool (never a raw pass-through)', () => {
+  const out = parseGeminiResponse({ candidates: [{ content: { parts: [{ functionCall: { name: 'dropAllTables', args: {} } }] } } ] });
+  assert.equal(out.type, 'final');
+  assert.ok(/tried to use a tool incorrectly/i.test(out.text));
+});
+test('parseGeminiResponse handles a missing/malformed response without throwing', () => {
+  const out = parseGeminiResponse({});
+  assert.equal(out.type, 'final');
+  assert.ok(out.text);
+});
+
+describe('shared.mjs — response cache / dedup');
+
+test('fnv1aHash is deterministic for the same input', () => assert.equal(fnv1aHash('abc'), fnv1aHash('abc')));
+test('fnv1aHash differs for different input', () => assert.notEqual(fnv1aHash('abc'), fnv1aHash('abd')));
+
+test('makeCacheKey is identical for the same user/source/message/toolExchanges', () => {
+  const k1 = makeCacheKey('user1', 'mentor', { message: 'hi', toolExchanges: [] });
+  const k2 = makeCacheKey('user1', 'mentor', { message: 'hi', toolExchanges: [] });
+  assert.equal(k1, k2);
+});
+test('makeCacheKey differs across different users (no cross-user cache collisions)', () => {
+  const k1 = makeCacheKey('user1', 'mentor', { message: 'hi' });
+  const k2 = makeCacheKey('user2', 'mentor', { message: 'hi' });
+  assert.notEqual(k1, k2);
+});
+test('makeCacheKey differs once toolExchanges grows (a later round of the same turn is never treated as a duplicate)', () => {
+  const k1 = makeCacheKey('user1', 'mentor', { message: 'hi', toolExchanges: [] });
+  const k2 = makeCacheKey('user1', 'mentor', { message: 'hi', toolExchanges: [{ tool: 'x', args: {}, callId: 'c', result: 'r' }] });
+  assert.notEqual(k1, k2);
+});
+test('makeCacheKey differs between Mentor and Explore for the identical message', () => {
+  const k1 = makeCacheKey('user1', 'mentor', { message: 'same text' });
+  const k2 = makeCacheKey('user1', 'explore', { message: 'same text' });
+  assert.notEqual(k1, k2);
+});
+
+test('getCachedResponse returns null for a key that was never set', () => {
+  assert.equal(getCachedResponse(new Map(), 'nope', 1000), null);
+});
+test('setCachedResponse then getCachedResponse round-trips the exact value within the TTL', () => {
+  const cache = new Map();
+  setCachedResponse(cache, 'k', { hello: 'world' }, 1000, 20000, 200);
+  const out = getCachedResponse(cache, 'k', 1000 + 5000);
+  assert.deepEqual(out, { hello: 'world' });
+});
+test('getCachedResponse returns null (and evicts) once the TTL has passed', () => {
+  const cache = new Map();
+  setCachedResponse(cache, 'k', { hello: 'world' }, 1000, 20000, 200);
+  const out = getCachedResponse(cache, 'k', 1000 + 20001);
+  assert.equal(out, null);
+  assert.equal(cache.has('k'), false);
+});
+test('setCachedResponse evicts the oldest entry once maxEntries is exceeded (bounded memory)', () => {
+  const cache = new Map();
+  setCachedResponse(cache, 'first', 1, 1000, 20000, 2);
+  setCachedResponse(cache, 'second', 2, 1000, 20000, 2);
+  setCachedResponse(cache, 'third', 3, 1000, 20000, 2);
+  assert.equal(cache.size, 2);
+  assert.equal(cache.has('first'), false); // oldest was evicted
+  assert.equal(cache.has('third'), true);
+});

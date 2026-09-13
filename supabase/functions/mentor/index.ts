@@ -49,6 +49,14 @@ import {
   SEARCH_TIMEOUT_MS,
   DEFAULT_SEARCH_RESULTS,
   MAX_TOOL_CALLS_PER_REQUEST,
+  buildGeminiContents,
+  toGeminiToolDefinitions,
+  parseGeminiResponse,
+  buildProviderOrder,
+  recordProviderCooldown,
+  makeCacheKey,
+  getCachedResponse,
+  setCachedResponse,
 } from './shared.mjs';
 
 const SUPABASE_URL = Deno.env.get('SUPABASE_URL');
@@ -65,6 +73,27 @@ const LLM_MODEL = Deno.env.get('LLM_MODEL') || DEFAULT_MODEL;
 // Whichever key the active provider actually needs — used only for the "is this
 // configured at all" check below, never logged or returned to the client.
 const ACTIVE_API_KEY = LLM_PROVIDER === 'anthropic' ? LLM_API_KEY : GROQ_API_KEY;
+
+// Gemini — the free automatic fallback for Groq, both on their free tiers only
+// (this app never adds a paid provider). Uses Google's "AI Studio" Generative
+// Language API key, deliberately NOT Vertex AI (which is billed). Entirely
+// optional: if GEMINI_API_KEY is unset, the router below simply never includes
+// Gemini in the provider order and behavior is byte-for-byte what it was before
+// this feature — Groq only, single attempt, same fail-fast-on-429 as always.
+// Only ever active alongside the default/"groq" LLM_PROVIDER mode — the
+// separate, opt-in, paid Anthropic path (LLM_PROVIDER=anthropic) is untouched.
+const GEMINI_API_KEY = Deno.env.get('GEMINI_API_KEY');
+const GEMINI_MODEL = Deno.env.get('GEMINI_MODEL') || 'gemini-2.0-flash';
+
+// ---- Provider cooldowns + response cache/dedup — module-level, in-memory only.
+// Supabase Edge Functions may reuse a warm isolate across requests for a while,
+// which is what makes this a useful (not just theoretical) optimization, but it
+// is explicitly best-effort: it resets on every cold start and is never shared
+// across concurrent isolates/regions. Nothing security- or correctness-critical
+// ever depends on it — see shared.mjs's own comments on each piece. ----
+let providerCooldowns: Record<string, number> = {};
+const responseCache = new Map();
+const inFlightRequests = new Map();
 
 // Phase 3 — real-world research. Tavily was chosen specifically for this: a
 // single simple REST endpoint, a free tier, and results already shaped for LLM
@@ -287,16 +316,19 @@ async function performWebSearch(args) {
   }
 }
 
-// One LLM call (either provider) plus response parsing — exactly what the
-// handler used to do inline. Pulled out so the tool-loop below can call it
-// repeatedly for server-executed tools without duplicating the fetch/error
-// handling for each provider.
-async function callLlmOnce(body) {
+// One LLM call to ONE specific provider, plus response parsing. Unlike the
+// original single-provider version, `provider` is now an explicit argument
+// (not read from the module-level LLM_PROVIDER constant) so callLlmWithFallback
+// below can try more than one provider within the same request. Never retries
+// internally — a 429/5xx/timeout is reported back as a structured outcome
+// (rateLimited / transientError) and it is the CALLER's job to decide whether
+// to try the next provider; this function makes exactly one HTTP call, always.
+async function callProvider(provider, body) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
   try {
     let r;
-    if (LLM_PROVIDER === 'anthropic') {
+    if (provider === 'anthropic') {
       r = await fetch('https://api.anthropic.com/v1/messages', {
         method: 'POST',
         headers: {
@@ -317,7 +349,23 @@ async function callLlmOnce(body) {
         }),
         signal: controller.signal,
       });
+    } else if (provider === 'gemini') {
+      r = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(GEMINI_MODEL)}:generateContent?key=${GEMINI_API_KEY}`,
+        {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            system_instruction: { parts: [{ text: buildSystemPrompt(body.context || {}) }] },
+            contents: buildGeminiContents(body),
+            tools: toGeminiToolDefinitions(MENTOR_TOOL_DEFINITIONS),
+            generationConfig: { maxOutputTokens: 800 },
+          }),
+          signal: controller.signal,
+        }
+      );
     } else {
+      // 'groq' — the free default/primary provider.
       r = await fetch('https://api.groq.com/openai/v1/chat/completions', {
         method: 'POST',
         headers: {
@@ -335,30 +383,156 @@ async function callLlmOnce(body) {
     }
     clearTimeout(timer);
     if (r.status === 429) {
-      // No automatic retry here, on purpose — the user explicitly asked not to
-      // wait through a blind retry/backoff. This fails fast. Groq sends a
-      // `retry-after` header on 429s — passed through as a plain NUMBER
-      // (retryAfterSeconds), not baked into the message text, so the client can
-      // drive a real live countdown instead of a static guess. Only a genuine
-      // whole-number header counts; anything else stays null so the client
-      // never fakes a countdown it doesn't actually have.
+      // Retry-After passed through as a plain NUMBER (retryAfterSeconds), not
+      // baked into message text, same as before — the client uses it to drive a
+      // real live countdown. Only a genuine whole-number header counts.
       const retryAfterRaw = r.headers.get('retry-after');
       const retryAfterSeconds = retryAfterRaw && /^\d+$/.test(retryAfterRaw) ? parseInt(retryAfterRaw, 10) : null;
-      return { httpError: { error: 'The AI provider is rate-limiting requests right now.', retryAfterSeconds }, status: 429 };
+      return { rateLimited: true, retryAfterSeconds };
+    }
+    if (r.status >= 500) {
+      // A transient server-side problem at the provider — worth trying the next
+      // provider in the router order (if any), unlike a 4xx (see below).
+      return { transientError: true };
     }
     if (!r.ok) {
+      // A genuine 4xx other than 429 (bad request / bad key / etc.) — almost
+      // certainly not something a different provider would handle any better,
+      // so this is reported straight to the client rather than retried.
       return { httpError: { error: 'The AI provider returned an error. Your Life OS data was not changed.' }, status: 502 };
     }
     const llmResponse = await r.json();
-    const parsed = LLM_PROVIDER === 'anthropic' ? parseAnthropicResponse(llmResponse) : parseOpenAIResponse(llmResponse);
+    const parsed =
+      provider === 'anthropic' ? parseAnthropicResponse(llmResponse) :
+      provider === 'gemini' ? parseGeminiResponse(llmResponse) :
+      parseOpenAIResponse(llmResponse);
     return { parsed };
   } catch (e) {
     clearTimeout(timer);
-    if (e && e.name === 'AbortError') {
-      return { httpError: { error: 'The AI Mentor took too long to respond. Try again.' }, status: 504 };
-    }
-    return { httpError: { error: 'Could not reach the AI provider right now. Your local data is unaffected.' }, status: 502 };
+    if (e && e.name === 'AbortError') return { transientError: true, timeout: true };
+    return { transientError: true };
   }
+}
+
+// Router: tries each provider in buildProviderOrder()'s order, in sequence,
+// stopping at the first success. Bounded by construction — at most as many
+// attempts as there are configured providers (today: at most 2, Groq then
+// Gemini) — never a blind retry loop against the SAME provider; that was a
+// deliberate earlier design decision (see the retry-after comment above) and
+// this preserves it exactly, just extended across providers instead of within
+// one. A provider that just 429'd gets a cooldown recorded so the NEXT request
+// (not just this one) skips straight past it instead of wasting a call.
+async function callLlmWithFallback(body, source) {
+  if (LLM_PROVIDER === 'anthropic') {
+    // Unchanged single-provider path — the free-tier Groq/Gemini router below
+    // never applies when the (paid, opt-in) Anthropic provider is selected.
+    const r = await callProvider('anthropic', body);
+    if (r.parsed) return { parsed: r.parsed };
+    if (r.rateLimited) return { httpError: { error: 'The AI provider is rate-limiting requests right now.', retryAfterSeconds: r.retryAfterSeconds }, status: 429 };
+    if (r.transientError) {
+      return r.timeout
+        ? { httpError: { error: 'The AI Mentor took too long to respond. Try again.' }, status: 504 }
+        : { httpError: { error: 'Could not reach the AI provider right now. Your local data is unaffected.' }, status: 502 };
+    }
+    return r; // already-shaped httpError/status from a non-ok, non-429, non-5xx response
+  }
+
+  const order = buildProviderOrder({
+    hasGroq: !!GROQ_API_KEY,
+    hasGemini: !!GEMINI_API_KEY,
+    source,
+    cooldowns: providerCooldowns,
+    now: Date.now(),
+  });
+  if (!order.length) {
+    // Every configured provider is currently cooling down (or, for an
+    // Explore-sourced request, the only available one is) — fail fast with the
+    // same rate-limit shape a live 429 would produce, no point spending a call.
+    return { httpError: { error: 'The AI provider is rate-limiting requests right now.', retryAfterSeconds: null }, status: 429 };
+  }
+
+  let lastFailure;
+  for (const provider of order) {
+    const r = await callProvider(provider, body);
+    if (r.parsed) return { parsed: r.parsed };
+    if (r.rateLimited) {
+      providerCooldowns = recordProviderCooldown(providerCooldowns, provider, r.retryAfterSeconds, Date.now());
+      lastFailure = { httpError: { error: 'The AI provider is rate-limiting requests right now.', retryAfterSeconds: r.retryAfterSeconds }, status: 429 };
+      continue;
+    }
+    if (r.transientError) {
+      lastFailure = r.timeout
+        ? { httpError: { error: 'The AI Mentor took too long to respond. Try again.' }, status: 504 }
+        : { httpError: { error: 'Could not reach the AI provider right now. Your local data is unaffected.' }, status: 502 };
+      continue;
+    }
+    // A genuine non-ok/non-429/non-5xx response — not worth trying the next
+    // provider, it would very likely fail identically (bad request shape, etc.).
+    return r;
+  }
+  return lastFailure;
+}
+
+// ---- Phase 3: bounded internal loop for server-executed tools ----
+// Most tool calls (getTodayPlan, logFood, etc.) still go straight back to the
+// client exactly as before — this loop only ever intercepts webSearch and
+// presentRecommendation, which must run here because their execution needs a
+// server-only secret (webSearch) or is pure structured output with no client
+// work to do (presentRecommendation). toolCallCount is shared across BOTH
+// server-side loop iterations and client-side round-trips — it's returned to
+// the client on every hand-off so its own recursion keeps counting from the
+// correct number instead of silently under-counting the calls made in here.
+// Pulled out of the request handler (unchanged in every other way) so the
+// caching/dedup layer around Deno.serve below can treat "run this turn" as one
+// unit of work with a single {responseBody,status} result to cache.
+async function runMentorTurn(body, source) {
+  let toolCallCount = typeof body.toolCallCount === 'number' ? body.toolCallCount : 0;
+  let toolExchanges = Array.isArray(body.toolExchanges) ? [...body.toolExchanges] : [];
+
+  for (let i = 0; i < MAX_TOOL_CALLS_PER_REQUEST + 1; i++) {
+    const { parsed, httpError, status } = await callLlmWithFallback({ ...body, toolCallCount, toolExchanges }, source);
+    if (httpError) return { responseBody: httpError, status };
+
+    if (parsed.type !== 'tool_call') {
+      // Plain final text — nothing server-side to do with it.
+      return { responseBody: parsed, status: 200 };
+    }
+
+    const def = findToolDefinition(parsed.tool);
+    if (!def || def.runsOn !== 'server') {
+      // A normal client-executed tool — unchanged behavior, just now also
+      // reporting the authoritative toolCallCount so the client's own
+      // recursion (sendRealAIMentorMessage in views/mentor.js) stays in sync
+      // with however many server-side steps already happened this turn.
+      return { responseBody: { ...parsed, toolCallCount: toolCallCount + 1 }, status: 200 };
+    }
+
+    toolCallCount += 1;
+    if (toolCallCount > MAX_TOOL_CALLS_PER_REQUEST) {
+      return { responseBody: { type: 'final', text: "That needs more research steps than I should take at once — here's what I can tell you from what I already checked. Try asking something more specific." }, status: 200 };
+    }
+
+    if (parsed.tool === 'presentRecommendation') {
+      // Structured final answer — ends the turn immediately, never loops back.
+      return { responseBody: { type: 'final', text: String((parsed.args && parsed.args.message) || ''), recommendation: buildRecommendationFromArgs(parsed.args) }, status: 200 };
+    }
+
+    // parsed.tool === 'webSearch' (the only other runsOn:'server' tool today).
+    const outcome = await performWebSearch(parsed.args);
+    // The blunt reinforcement here (not just the system prompt) matters: a
+    // smaller/weaker model can otherwise treat "the tool failed" as a minor
+    // inconvenience and quietly answer from its own training memory instead —
+    // exactly the fabrication this phase exists to prevent.
+    const resultStr = outcome.error
+      ? `Error: ${outcome.error}. You have NO real-world information for this request. Do not name any business, place, or event from your own memory — tell the user honestly that live search isn't available right now.`
+      : wrapUntrustedSearchContent(outcome.results);
+    toolExchanges = [...toolExchanges, { tool: parsed.tool, args: parsed.args, callId: parsed.callId, result: resultStr }];
+    // loop again with the search result now in toolExchanges — the model sees it
+    // on the next round and decides what to do next (another search,
+    // presentRecommendation, or a plain final answer).
+  }
+
+  return { responseBody: { type: 'final', text: "That needs more research steps than I should take at once — here's what I can tell you from what I already checked." }, status: 200 };
 }
 
 Deno.serve(async (req) => {
@@ -368,6 +542,9 @@ Deno.serve(async (req) => {
 
   if (!ACTIVE_API_KEY) {
     // A configuration problem on the server, never a client-side secret leak.
+    // Gemini is an optional ADDITIONAL fallback, not a replacement for Groq —
+    // this check is unchanged, so an unset GEMINI_API_KEY is never treated as a
+    // configuration error; it just means no automatic fallback is available.
     const missingVar = LLM_PROVIDER === 'anthropic' ? 'LLM_API_KEY' : 'GROQ_API_KEY';
     return jsonResponse(
       { error: `The AI Mentor backend is not configured yet (missing ${missingVar}). This is a server setup issue, not something wrong on your device — the local Mentor still works.` },
@@ -397,60 +574,46 @@ Deno.serve(async (req) => {
   const limitCheck = checkRequestLimits(body);
   if (!limitCheck.ok) return jsonResponse({ error: limitCheck.error }, 400, cors);
 
-  // ---- Phase 3: bounded internal loop for server-executed tools ----
-  // Most tool calls (getTodayPlan, logFood, etc.) still go straight back to the
-  // client exactly as before — this loop only ever intercepts webSearch and
-  // presentRecommendation, which must run here because their execution needs a
-  // server-only secret (webSearch) or is pure structured output with no client
-  // work to do (presentRecommendation). toolCallCount is shared across BOTH
-  // server-side loop iterations and client-side round-trips — it's returned to
-  // the client on every hand-off so its own recursion keeps counting from the
-  // correct number instead of silently under-counting the calls made in here.
-  let toolCallCount = typeof body.toolCallCount === 'number' ? body.toolCallCount : 0;
-  let toolExchanges = Array.isArray(body.toolExchanges) ? [...body.toolExchanges] : [];
+  // 'explore' only when the client explicitly says so (Explore's own
+  // exploreResearch() in views/explore.js) — every other caller (real Mentor
+  // chat, and any older deployed frontend that predates this field) is treated
+  // as 'mentor', which is the more permissive/full-access path. See
+  // buildProviderOrder in shared.mjs for exactly what this changes.
+  const source = body.source === 'explore' ? 'explore' : 'mentor';
 
-  for (let i = 0; i < MAX_TOOL_CALLS_PER_REQUEST + 1; i++) {
-    const { parsed, httpError, status } = await callLlmOnce({ ...body, toolCallCount, toolExchanges });
-    if (httpError) return jsonResponse(httpError, status, cors);
+  // ---- Response cache + in-flight dedup ----
+  // Keyed by (user, source, exact message, exact toolExchanges-so-far) — see
+  // makeCacheKey in shared.mjs. This absorbs the common real case (a
+  // double-tap Send, or a client retry firing while the previous identical
+  // request is technically still in flight) without adding any user-visible
+  // behavior change on a genuine new turn.
+  const cacheKey = makeCacheKey(userData.user.id, source, body);
+  const now = Date.now();
+  const cached = getCachedResponse(responseCache, cacheKey, now);
+  if (cached) return jsonResponse(cached.responseBody, cached.status, cors);
 
-    if (parsed.type !== 'tool_call') {
-      // Plain final text — nothing server-side to do with it.
-      return jsonResponse(parsed, 200, cors);
-    }
-
-    const def = findToolDefinition(parsed.tool);
-    if (!def || def.runsOn !== 'server') {
-      // A normal client-executed tool — unchanged behavior, just now also
-      // reporting the authoritative toolCallCount so the client's own
-      // recursion (sendRealAIMentorMessage in views/mentor.js) stays in sync
-      // with however many server-side steps already happened this turn.
-      return jsonResponse({ ...parsed, toolCallCount: toolCallCount + 1 }, 200, cors);
-    }
-
-    toolCallCount += 1;
-    if (toolCallCount > MAX_TOOL_CALLS_PER_REQUEST) {
-      return jsonResponse({ type: 'final', text: "That needs more research steps than I should take at once — here's what I can tell you from what I already checked. Try asking something more specific." }, 200, cors);
-    }
-
-    if (parsed.tool === 'presentRecommendation') {
-      // Structured final answer — ends the turn immediately, never loops back.
-      return jsonResponse({ type: 'final', text: String((parsed.args && parsed.args.message) || ''), recommendation: buildRecommendationFromArgs(parsed.args) }, 200, cors);
-    }
-
-    // parsed.tool === 'webSearch' (the only other runsOn:'server' tool today).
-    const outcome = await performWebSearch(parsed.args);
-    // The blunt reinforcement here (not just the system prompt) matters: a
-    // smaller/weaker model can otherwise treat "the tool failed" as a minor
-    // inconvenience and quietly answer from its own training memory instead —
-    // exactly the fabrication this phase exists to prevent.
-    const resultStr = outcome.error
-      ? `Error: ${outcome.error}. You have NO real-world information for this request. Do not name any business, place, or event from your own memory — tell the user honestly that live search isn't available right now.`
-      : wrapUntrustedSearchContent(outcome.results);
-    toolExchanges = [...toolExchanges, { tool: parsed.tool, args: parsed.args, callId: parsed.callId, result: resultStr }];
-    // loop again with the search result now in toolExchanges — the model sees it
-    // on the next callLlmOnce and decides what to do next (another search,
-    // presentRecommendation, or a plain final answer).
+  if (inFlightRequests.has(cacheKey)) {
+    // An identical request from this same user is already being processed —
+    // await and reuse that SAME result instead of starting a second, redundant
+    // provider call (and, for a destructive/write tool, a second side effect).
+    const result = await inFlightRequests.get(cacheKey);
+    return jsonResponse(result.responseBody, result.status, cors);
   }
 
-  return jsonResponse({ type: 'final', text: "That needs more research steps than I should take at once — here's what I can tell you from what I already checked." }, 200, cors);
+  const turnPromise = runMentorTurn(body, source);
+  inFlightRequests.set(cacheKey, turnPromise);
+  let result;
+  try {
+    result = await turnPromise;
+  } finally {
+    inFlightRequests.delete(cacheKey);
+  }
+
+  // Only a genuine 200 is ever cached — caching an error (rate-limited, timed
+  // out, etc.) would make a legitimate retry (e.g. right after a cooldown ends)
+  // come back stale instead of actually retrying. See setCachedResponse's own
+  // comment in shared.mjs.
+  if (result.status === 200) setCachedResponse(responseCache, cacheKey, result, now);
+
+  return jsonResponse(result.responseBody, result.status, cors);
 });

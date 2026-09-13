@@ -56,24 +56,39 @@ The only thing the browser stores about the AI Mentor is the **endpoint URL** (S
 
 ### Deploying the backend
 
-This has **not** been deployed as part of this work — deployment requires your own Supabase CLI login and project, which this environment does not have access to. To deploy it yourself:
+Deployment requires your own Supabase CLI login (or the Dashboard's own Edge Function editor) — this environment does not have Supabase CLI access, so any change to `supabase/functions/mentor/*` needs to be deployed by you:
 
 ```
 supabase functions deploy mentor
 
-# Default provider — Groq (free):
+# Primary provider — Groq (free):
 supabase secrets set GROQ_API_KEY=YOUR_GROQ_API_KEY
 supabase secrets set LLM_MODEL=openai/gpt-oss-120b   # optional, this is the default for Groq
 
-# Optional alternative — Anthropic (paid):
+# Automatic fallback — Gemini (also free-tier only, never Vertex AI/billed):
+supabase secrets set GEMINI_API_KEY=YOUR_GEMINI_API_KEY   # optional — get a free key at aistudio.google.com/apikey
+supabase secrets set GEMINI_MODEL=gemini-2.0-flash        # optional, this is the default
+
+# Optional alternative — Anthropic (paid, replaces Groq+Gemini entirely):
 supabase secrets set LLM_PROVIDER=anthropic
 supabase secrets set LLM_API_KEY=YOUR_ANTHROPIC_API_KEY
 supabase secrets set LLM_MODEL=claude-sonnet-5       # optional, this is the default for Anthropic
 ```
 
-`LLM_PROVIDER` defaults to `groq` — you only need to set it if you want `anthropic` instead. Only the key for whichever provider is active needs to be set.
+`LLM_PROVIDER` defaults to `groq` — you only need to set it if you want `anthropic` instead. `GEMINI_API_KEY` is entirely optional: without it, Mentor behaves exactly as it always has (Groq only, single attempt per request). With it set, Mentor automatically falls back to Gemini within the same request whenever Groq is rate-limited (HTTP 429) or has a transient server error — see "Provider router" below.
 
 `SUPABASE_URL` and `SUPABASE_ANON_KEY` are provided automatically to every Edge Function — you don't set those yourself. After deploying, copy the function's URL (shown by the deploy command, typically `https://<project-ref>.supabase.co/functions/v1/mentor`) into Life OS → Settings → Real AI Mentor → Backend endpoint URL, and enable it.
+
+### Provider router (Groq primary + Gemini free-tier fallback)
+
+Both providers are used on their free tiers only — this app never adds a paid provider or paid usage. When both `GROQ_API_KEY` and `GEMINI_API_KEY` are set (and `LLM_PROVIDER` is left at its `groq` default):
+
+- **Primary**: every request tries Groq first.
+- **Automatic fallback**: if Groq returns a rate-limit (429) or a transient server error, the *same request* automatically retries against Gemini instead of failing — no extra round-trip from the client, no blind retry against Groq itself.
+- **Provider cooldowns**: once a provider 429s, it's skipped entirely (not even attempted) on subsequent requests for a short window — using that provider's own `Retry-After` header when it sends one, or 30 seconds otherwise. This is in-memory/best-effort (resets on a cold start), not a persisted setting.
+- **Response cache + dedup**: an identical request from the same signed-in user (same message, same point in a tool-call conversation) within ~20 seconds is served from a short-lived in-memory cache instead of calling the provider again — this mainly absorbs a double-tap Send or a client retry firing while the previous identical request is still in flight. Only successful answers are ever cached; a rate-limit/error response never is, so a legitimate retry after a cooldown always actually retries.
+- **Mentor priority**: Explore's own live-discovery research reuses this same backend, but it never gets the Gemini fallback — only a real Mentor chat message does. If Groq is cooling down, an Explore request fails fast instead of spending Gemini's shared free-tier quota, which is reserved for the conversation the user is actually having.
+- **Never falls back to Local Mentor**: if every available provider is unavailable, the Edge Function returns an honest rate-limit/unavailable error — the client (`views/mentor.js`) never silently substitutes the deterministic Local Mentor for a Real AI failure; that's a deliberate, pre-existing design decision this feature does not change.
 
 ### Authentication
 

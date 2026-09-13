@@ -678,7 +678,13 @@ async function sendRealAIMentorMessage(userText,resumeState){
     history:(S.mentorMessages||[]).slice(-11,-1).map(m=>({role:m.role,text:m.text})),
     context:buildMentorContext(S,today(),await resolveCurrentLocationForRequest()),
     toolCallCount:0,
-    toolExchanges:[] // accumulates every {tool,args,callId,result} this turn, in order — see index.ts buildAnthropicMessages
+    toolExchanges:[], // accumulates every {tool,args,callId,result} this turn, in order — see index.ts buildAnthropicMessages
+    // Lets the backend's provider router give a real Mentor conversation
+    // priority over Explore's background research when its free-tier Gemini
+    // fallback is scarce — see buildProviderOrder in shared.mjs. Every
+    // recursive continuation of this same turn (resumeState above) already
+    // carries this through automatically via the spread.
+    source:'mentor'
   };
   let backendData;
   try{ backendData=await callMentorBackend(turnState); }

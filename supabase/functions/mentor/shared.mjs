@@ -319,3 +319,151 @@ ${(context&&context.location&&context.location.current)?`The user has enabled de
 export function toolCallLimitExceeded(toolCallCount){
   return typeof toolCallCount==='number'&&toolCallCount>=MAX_TOOL_CALLS_PER_REQUEST;
 }
+
+// ---- Multi-provider router (Groq primary + Gemini free-tier fallback) ----
+// Both Groq and Gemini are used only on their free tiers — this app never adds a
+// paid provider or paid usage. Everything below is pure/Deno-free (no fetch, no
+// Deno.env) so it's unit-testable from plain Node exactly like the rest of this
+// file; index.ts wires these into the actual network calls and holds the only
+// mutable state (module-level cooldowns/cache objects), same separation the rest
+// of this file already keeps between "policy" (here) and "the actual HTTP calls"
+// (index.ts).
+export const DEFAULT_PROVIDER_COOLDOWN_MS = 30000;
+export const RESPONSE_CACHE_TTL_MS = 20000;
+export const RESPONSE_CACHE_MAX_ENTRIES = 200;
+
+export function isProviderCoolingDown(cooldowns, provider, now){
+  return !!(cooldowns && typeof cooldowns[provider]==='number' && cooldowns[provider]>now);
+}
+
+// Records a fresh cooldown for a provider that just returned 429 — prefers the
+// provider's own Retry-After value (most accurate) and falls back to a sane
+// default otherwise. Returns a NEW cooldowns object; never mutates the one
+// passed in, so the caller can hold whatever it returns in a plain variable.
+export function recordProviderCooldown(cooldowns, provider, retryAfterSeconds, now){
+  const ms = (typeof retryAfterSeconds==='number' && retryAfterSeconds>0) ? retryAfterSeconds*1000 : DEFAULT_PROVIDER_COOLDOWN_MS;
+  return { ...(cooldowns||{}), [provider]: now + ms };
+}
+
+// Builds the ordered list of providers to actually try for this one request.
+// Groq (the free default/primary) always goes first when configured and not
+// currently cooling down from a recent 429 — a provider already known to be
+// rate-limited is skipped entirely rather than wasted on a request we already
+// expect to fail.
+//
+// "Mentor priority": Explore's live-discovery research (exploreResearch() in
+// views/explore.js) reuses this exact same backend/pipe as Mentor's own chat —
+// see explore.js's own comment "same recursive tool loop... same webSearch/
+// presentRecommendation/Tavily path" — but it is a supplementary feature, not
+// the app's primary conversational surface. So when Groq is cooling down, an
+// Explore-sourced request does NOT fall through to Gemini; only a genuine
+// Mentor chat message (source !== 'explore') gets the automatic fallback. This
+// reserves Gemini's free-tier quota for the conversation the user is actually
+// having, rather than letting background Explore research silently burn
+// through the one thing standing between Mentor and "AI unavailable" for
+// everyone. Explore still gets normal access to Groq itself either way — this
+// only ever affects the FALLBACK provider.
+export function buildProviderOrder({ hasGroq, hasGemini, source, cooldowns, now }){
+  const isMentor = source !== 'explore';
+  const order = [];
+  if (hasGroq && !isProviderCoolingDown(cooldowns, 'groq', now)) order.push('groq');
+  if (hasGemini && isMentor && !isProviderCoolingDown(cooldowns, 'gemini', now)) order.push('gemini');
+  return order;
+}
+
+// ---- Gemini (Generative Language API, generateContent) — provider implementation ----
+// Google's free-tier "AI Studio" API key against generativelanguage.googleapis.com
+// — deliberately NOT Vertex AI, which is billed. Mirrors buildAnthropicMessages/
+// buildOpenAIMessages in index.ts: same {message,history,context,toolExchanges}
+// input, translated into Gemini's `contents` shape (role "model" instead of
+// "assistant"; a tool call is a `functionCall` part on a model turn, its result a
+// `functionResponse` part on the following "function" turn).
+export function buildGeminiContents(body){
+  const history = (body.history||[]).slice(-10).map(m => ({
+    role: m.role==='user' ? 'user' : 'model',
+    parts: [{ text: String(m.text||'').slice(0,2000) }],
+  }));
+  const contents = [...history, { role:'user', parts:[{ text: String(body.message||'') }] }];
+  const exchanges = Array.isArray(body.toolExchanges) ? body.toolExchanges : [];
+  for (const ex of exchanges){
+    contents.push({ role:'model', parts:[{ functionCall: { name: String(ex.tool||''), args: ex.args||{} } }] });
+    contents.push({ role:'function', parts:[{ functionResponse: { name: String(ex.tool||''), response: { result: String(ex.result||'') } } }] });
+  }
+  return contents;
+}
+
+// MENTOR_TOOL_DEFINITIONS' `schema` is already plain JSON Schema, same as the
+// OpenAI/Anthropic paths reuse it — Gemini's function-calling `parameters`
+// field accepts the same simple {type,properties,required} shape this app's
+// tool schemas already use.
+export function toGeminiToolDefinitions(defs){
+  return [{ functionDeclarations: defs.map(t => ({ name:t.name, description:t.description, parameters:t.schema })) }];
+}
+
+// Gemini's functionCall part carries no call-id of its own (unlike OpenAI/
+// Anthropic) — this app's toolExchanges bookkeeping needs SOME opaque id to
+// round-trip, so one is synthesized here. It is never parsed for meaning
+// anywhere else (checkRequestLimits only requires ex.callId to be a string).
+function synthesizeGeminiCallId(){
+  if (typeof globalThis!=='undefined' && globalThis.crypto && typeof globalThis.crypto.randomUUID==='function'){
+    return 'gemini-'+globalThis.crypto.randomUUID();
+  }
+  return 'gemini-'+Date.now()+'-'+Math.random().toString(36).slice(2);
+}
+export function parseGeminiResponse(llmResponse){
+  const candidate = llmResponse && Array.isArray(llmResponse.candidates) ? llmResponse.candidates[0] : null;
+  const parts = (candidate && candidate.content && candidate.content.parts) || [];
+  const callPart = parts.find(p => p && p.functionCall);
+  if (callPart){
+    const name = String((callPart.functionCall && callPart.functionCall.name) || '');
+    const args = (callPart.functionCall && callPart.functionCall.args) || {};
+    const validation = validateToolCall(name, args);
+    if (!validation.ok) return { type:'final', text:`I tried to use a tool incorrectly (${validation.error}). Let's try that a different way.` };
+    return { type:'tool_call', tool:name, args, callId:synthesizeGeminiCallId() };
+  }
+  const textPart = parts.find(p => p && typeof p.text==='string');
+  return { type:'final', text: (textPart && textPart.text) || "I don't have a response for that." };
+}
+
+// ---- Response cache / in-flight dedup ----
+// Purely in-memory (a plain Map the caller owns) — this is a best-effort
+// optimization, not a durable store: it resets on every cold start and is not
+// shared across concurrent edge-runtime instances/regions. Its only job is
+// cheap and safe to get slightly wrong: absorbing the common real case (a
+// double-tap Send, or a client retry firing while the previous identical
+// request is technically still in flight) — never anything correctness-
+// critical, since a cache miss just means "call the provider like normal."
+export function fnv1aHash(str){
+  let h = 0x811c9dc5;
+  for (let i=0;i<str.length;i++){
+    h ^= str.charCodeAt(i);
+    h = Math.imul(h, 0x01000193);
+  }
+  return (h>>>0).toString(36);
+}
+// Keyed by (user + source + exact message + exact toolExchanges-so-far) — two
+// DIFFERENT rounds of the same multi-step tool conversation naturally get
+// different keys (toolExchanges grows each round), so only a genuinely
+// identical resend of the exact same turn ever collides.
+export function makeCacheKey(userId, source, body){
+  const raw = String(userId||'')+'|'+String(source||'mentor')+'|'+String(body.message||'')+'|'+JSON.stringify(body.toolExchanges||[]);
+  return fnv1aHash(raw);
+}
+export function getCachedResponse(cache, key, now){
+  const entry = cache.get(key);
+  if (!entry) return null;
+  if (entry.expiresAt<=now){ cache.delete(key); return null; }
+  return entry.value;
+}
+// Never call this with an error/rate-limited result — see index.ts, which only
+// caches a genuine 200. Caching an error would make a legitimate retry (e.g.
+// right after a rate-limit cooldown ends) come back stale instead of actually
+// retrying.
+export function setCachedResponse(cache, key, value, now, ttlMs, maxEntries){
+  cache.set(key, { value, expiresAt: now+(ttlMs||RESPONSE_CACHE_TTL_MS) });
+  const cap = maxEntries||RESPONSE_CACHE_MAX_ENTRIES;
+  while (cache.size>cap){
+    const oldestKey = cache.keys().next().value; // Map preserves insertion order
+    cache.delete(oldestKey);
+  }
+}

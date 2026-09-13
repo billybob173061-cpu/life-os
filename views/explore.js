@@ -290,7 +290,13 @@ async function exploreResearch(promptText){
     history:[],
     context:buildMentorContext(S,today(),await resolveCurrentLocationForRequest()),
     toolCallCount:0,
-    toolExchanges:[]
+    toolExchanges:[],
+    // Tags this request as Explore (not a real Mentor chat message) so the
+    // backend's provider router can reserve its free-tier Gemini fallback for
+    // Mentor's own conversation when Groq is rate-limited — see
+    // buildProviderOrder in shared.mjs. Explore still uses Groq normally
+    // either way; this only ever affects the fallback provider.
+    source:'explore'
   };
   const outcome=await sendRealAIMentorMessage(null,turnState);
   if(myGeneration!==mentorRequestGeneration) return null; // signed out mid-flight — discard
